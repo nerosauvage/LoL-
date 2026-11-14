@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.4"
+VERSION = "0.5"
 PROGRAM_DATA = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
 RIOT_DATA = os.path.join(PROGRAM_DATA, "Riot Games")
 STATE_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "lol-hanhua")
@@ -151,6 +151,98 @@ def apply_locale(path, locale):
 def set_readonly(path, readonly):
     mode = os.stat(path).st_mode
     os.chmod(path, mode & ~stat.S_IWUSR if readonly else mode | stat.S_IWUSR)
+
+
+# ---------- 语言包缓存 ----------
+#
+# 客户端把语言改回默认值后，更新器会把 zh_CN 的语言包文件删掉，下次又得重新下载。
+# 这里用硬链接把这些文件留一份在安装目录旁边（同一个盘上不额外占空间，瞬间完成），
+# 被删了就原样放回去，更新器校验通过就不用再下载。
+
+def install_dir(text):
+    m = re.search(r'^product_install_full_path\s*:\s*(.+?)\s*$', text, re.M)
+    if not m:
+        return None
+    path = os.path.normpath(m.group(1).strip().strip("\"'"))
+    return path if os.path.isdir(path) else None
+
+
+def cache_dir(game_dir, locale):
+    return os.path.join(os.path.dirname(game_dir), "lol-hanhua-cache", locale)
+
+
+def _same(a, b):
+    try:
+        if os.path.samefile(a, b):
+            return True
+        sa, sb = os.stat(a), os.stat(b)
+        return sa.st_size == sb.st_size and int(sa.st_mtime) == int(sb.st_mtime)
+    except OSError:
+        return False
+
+
+def _place(src, dst):
+    """把 src 放到 dst：优先硬链接，跨盘时退回复制。"""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    tmp = dst + ".lolhanhua-tmp"
+    try:
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        try:
+            os.link(src, tmp)
+        except OSError:
+            shutil.copy2(src, tmp)
+        os.replace(tmp, dst)
+        return True
+    except OSError:
+        return False
+
+
+def cache_save(path, locale):
+    """把安装目录里属于 locale 的文件记进缓存。返回新增/更新的文件数。"""
+    try:
+        game = install_dir(load(path))
+    except OSError:
+        game = None
+    if not game:
+        return 0
+    cache, needle, n = cache_dir(game, locale), locale.lower(), 0
+    for root, _, files in os.walk(game):
+        for name in files:
+            if needle not in name.lower() or name.endswith(".lolhanhua-tmp"):
+                continue
+            src = os.path.join(root, name)
+            dst = os.path.join(cache, os.path.relpath(src, game))
+            if not _same(src, dst) and _place(src, dst):
+                n += 1
+    return n
+
+
+def cache_restore(path, locale):
+    """把被更新器删掉的语言包文件从缓存放回去。返回放回的文件数。"""
+    try:
+        game = install_dir(load(path))
+    except OSError:
+        game = None
+    if not game:
+        return 0
+    cache, n = cache_dir(game, locale), 0
+    for root, _, files in os.walk(cache):
+        for name in files:
+            src = os.path.join(root, name)
+            dst = os.path.join(game, os.path.relpath(src, cache))
+            if not os.path.exists(dst) and _place(src, dst):
+                n += 1
+    return n
+
+
+def cache_clear(path, locale):
+    try:
+        game = install_dir(load(path))
+    except OSError:
+        return
+    if game:
+        shutil.rmtree(os.path.dirname(cache_dir(game, locale)), ignore_errors=True)
 
 
 # ---------- 记住原来的语言，方便还原 ----------
@@ -291,6 +383,7 @@ class LocalApi:
 
 
 _api_rejects = [0]
+USE_CACHE = [True]
 
 
 def sync(path, patchline, locale):
@@ -301,9 +394,12 @@ def sync(path, patchline, locale):
         if not api.set_product_locale(patchline, locale):
             _api_rejects[0] += 1
     try:
-        return apply_locale(path, locale)[1]
+        changed = apply_locale(path, locale)[1]
     except (OSError, ValueError):
         return True  # 客户端正在写文件，下一轮再来
+    if changed and USE_CACHE[0]:
+        cache_restore(path, locale)
+    return changed
 
 
 def launch_game(path, patchline, locale, client, timeout):
@@ -371,7 +467,7 @@ def watch(patchline, locale):
     with open(PID_FILE, "w", encoding="utf-8") as f:
         f.write(str(os.getpid()))
     path = settings_path(patchline)
-    seen, last_full = None, 0.0
+    seen, last_full, ticks = None, 0.0, 0
     while True:
         try:
             st = os.stat(path)
@@ -382,6 +478,12 @@ def watch(patchline, locale):
         if sig is not None and (sig != seen or now - last_full > 30):
             sync(path, patchline, locale)
             last_full = now
+            if USE_CACHE[0]:
+                # 缺的放回去；游戏开着说明更新已完成，这时把语言包记进缓存
+                cache_restore(path, locale)
+                ticks += 1
+                if ticks % 4 == 0 and any(is_running(exe) for exe in GAME_EXES):
+                    cache_save(path, locale)
             try:
                 st = os.stat(path)
                 seen = (st.st_mtime_ns, st.st_size)
@@ -402,7 +504,7 @@ def _watch_command(patchline, locale):
     else:
         pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
         cmd = [pythonw if os.path.isfile(pythonw) else sys.executable, os.path.abspath(__file__)]
-    return cmd + ["--watch", "--locale", locale, "--patchline", patchline]
+    return cmd + ["--watch", "--locale", locale, "--patchline", patchline] + ([] if USE_CACHE[0] else ["--no-cache"])
 
 
 def stop_watch():
@@ -412,8 +514,11 @@ def stop_watch():
     except (OSError, ValueError):
         return
     if pid != os.getpid():
-        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except OSError:
+            pass
     try:
         os.remove(PID_FILE)
     except OSError:
@@ -496,6 +601,12 @@ def run(args):
     if not args.restore:
         remember_original(patchline, before if before != locale else None)
     info(f"当前语言: {before}  ->  新语言: {locale}")
+    if args.restore:
+        cache_clear(path, before or "")
+    elif USE_CACHE[0]:
+        n = cache_restore(path, locale)
+        if n:
+            info(f"已从缓存放回 {n} 个语言包文件，不用重新下载。")
     if not is_available(load(path), locale):
         warn("配置文件里没有 available_locales 列表，客户端可能不接受这个语言。")
 
@@ -516,6 +627,10 @@ def run(args):
             pass
         if launched:
             guard(path, patchline, locale, 5, 20)
+            if USE_CACHE[0]:
+                n = cache_save(path, locale)
+                if n:
+                    info(f"已缓存 {n} 个语言包文件，下次被客户端删掉也不用重新下载。")
 
     final_text = load(path)
     final = read_locale(final_text)
@@ -558,8 +673,10 @@ def main():
     p.add_argument("--install", action="store_true", help="开启「保持汉化」：开机自启、后台常驻，客户端改回去就自动改回来")
     p.add_argument("--uninstall", action="store_true", help="关闭「保持汉化」")
     p.add_argument("--watch", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--no-cache", action="store_true", help="不缓存语言包")
     p.add_argument("--no-pause", action="store_true", help="结束时不等待回车")
     args = p.parse_args()
+    USE_CACHE[0] = not args.no_cache
 
     if args.watch:
         if LOCALE_RE.match(args.locale):

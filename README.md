@@ -43,6 +43,10 @@
 
 `available_locales` 和本地接口的做法参考了 [Tariolle/LeagueAccounts](https://github.com/Tariolle/LeagueAccounts)（MIT）。
 
+语言包缓存：客户端把语言改回默认值后，更新器会删掉 `zh_CN` 的语言包，下次又要重新下载。
+脚本会用硬链接在安装目录旁边的 `lol-hanhua-cache` 里留一份（同盘不额外占空间），被删了就放回去。
+`-r` 还原语言时会清掉缓存；`--no-cache` 可关闭这个功能。
+
 已知问题：`zh_CN` 下客户端首页的活动页可能是空白的（Riot 没给外服发布简体中文的活动资源），不影响对局。
 
 ## 自己打包
