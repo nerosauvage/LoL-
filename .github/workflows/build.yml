@@ -1,0 +1,20 @@
+name: build
+on:
+  push:
+    paths: ["lol.py", ".github/workflows/build.yml"]
+  workflow_dispatch:
+jobs:
+  exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller
+      - run: pyinstaller --onefile --name lol-hanhua lol.py
+      - run: python lol.py --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lol-hanhua
+          path: dist/lol-hanhua.exe
