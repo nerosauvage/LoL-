@@ -424,8 +424,24 @@ def run(args):
     return 0
 
 
-def main():
+def setup_console():
+    """非中文系统的控制台默认编码打不出中文，统一切到 UTF-8。"""
     os.system("")  # 让 Windows 控制台支持颜色
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+        except Exception:
+            pass
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
+def main():
+    setup_console()
     p = argparse.ArgumentParser(description=f"外服 LoL 一键汉化 v{VERSION}")
     p.add_argument("-l", "--locale", default="zh_CN", help="目标语言，默认 zh_CN（也可 zh_TW / ja_JP / ko_KR 等）")
     p.add_argument("-r", "--restore", action="store_true", help="还原成汉化前的语言")

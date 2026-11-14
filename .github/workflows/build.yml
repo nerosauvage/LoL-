@@ -14,6 +14,7 @@ jobs:
       - run: pip install pyinstaller
       - run: pyinstaller --onefile --name lol-hanhua lol.py
       - run: python lol.py --help
+      - run: dist/lol-hanhua.exe --help
       - uses: actions/upload-artifact@v4
         with:
           name: lol-hanhua
