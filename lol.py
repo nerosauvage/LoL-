@@ -15,6 +15,7 @@ import base64
 import json
 import os
 import re
+import shutil
 import ssl
 import stat
 import subprocess
@@ -23,7 +24,7 @@ import time
 import urllib.error
 import urllib.request
 
-VERSION = "0.3"
+VERSION = "0.4"
 PROGRAM_DATA = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
 RIOT_DATA = os.path.join(PROGRAM_DATA, "Riot Games")
 STATE_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "lol-hanhua")
@@ -346,6 +347,111 @@ def guard(path, patchline, locale, quiet_for, timeout):
         time.sleep(0.5)
 
 
+# ---------- 后台常驻：开机自启，一直守着语言设置 ----------
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = "lol-hanhua"
+PID_FILE = os.path.join(STATE_DIR, "watch.pid")
+
+
+def hide_console():
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
+
+
+def watch(patchline, locale):
+    """常驻后台：配置文件一有变化就把语言改回来。平时只做一次 stat，几乎不占资源。"""
+    hide_console()
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(PID_FILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+    path = settings_path(patchline)
+    seen, last_full = None, 0.0
+    while True:
+        try:
+            st = os.stat(path)
+            sig = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            sig = None  # 游戏还没装 / 正在被重写
+        now = time.monotonic()
+        if sig is not None and (sig != seen or now - last_full > 30):
+            sync(path, patchline, locale)
+            last_full = now
+            try:
+                st = os.stat(path)
+                seen = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                seen = None
+        time.sleep(0.5)
+
+
+def _watch_command(patchline, locale):
+    """开机自启要执行的命令。打包版会把 exe 复制到固定位置，免得原文件被挪走。"""
+    if getattr(sys, "frozen", False):
+        os.makedirs(STATE_DIR, exist_ok=True)
+        target = os.path.join(STATE_DIR, "lol-hanhua.exe")
+        if os.path.normcase(os.path.abspath(sys.executable)) != os.path.normcase(target):
+            stop_watch()
+            shutil.copy2(sys.executable, target)
+        cmd = [target]
+    else:
+        pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+        cmd = [pythonw if os.path.isfile(pythonw) else sys.executable, os.path.abspath(__file__)]
+    return cmd + ["--watch", "--locale", locale, "--patchline", patchline]
+
+
+def stop_watch():
+    try:
+        with open(PID_FILE, "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return
+    if pid != os.getpid():
+        subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+
+
+def is_installed():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            winreg.QueryValueEx(key, RUN_NAME)
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+def install(patchline, locale):
+    import winreg
+    cmd = _watch_command(patchline, locale)
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+        winreg.SetValueEx(key, RUN_NAME, 0, winreg.REG_SZ, subprocess.list2cmdline(cmd))
+    stop_watch()
+    spawn(cmd)
+    info("已开启「保持汉化」：开机自动在后台运行，以后直接打开 Riot Client 玩就行。")
+    info("想关闭的话运行: lol-hanhua.exe --uninstall（或 -r 还原语言时会一并关闭）")
+
+
+def uninstall():
+    stop_watch()
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, RUN_NAME)
+        info("已关闭「保持汉化」。")
+    except (ImportError, OSError):
+        pass
+
+
 # ---------- 主流程 ----------
 
 def run(args):
@@ -353,6 +459,7 @@ def run(args):
     path = settings_path(patchline)
 
     if args.restore:
+        uninstall()  # 不然后台程序会把语言又改回去
         locale = original_locale(patchline) or "en_US"
         info(f"还原语言为 {locale}")
     else:
@@ -448,8 +555,19 @@ def main():
     p.add_argument("--patchline", default="live", help="live（默认）或 pbe")
     p.add_argument("--no-launch", action="store_true", help="只改配置，不启动客户端和游戏")
     p.add_argument("--wait", type=int, default=30, help="最多等游戏启动多少分钟（含登录和更新），默认 30")
+    p.add_argument("--install", action="store_true", help="开启「保持汉化」：开机自启、后台常驻，客户端改回去就自动改回来")
+    p.add_argument("--uninstall", action="store_true", help="关闭「保持汉化」")
+    p.add_argument("--watch", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--no-pause", action="store_true", help="结束时不等待回车")
     args = p.parse_args()
+
+    if args.watch:
+        if LOCALE_RE.match(args.locale):
+            watch(args.patchline, args.locale)
+        return 2
+    if args.uninstall:
+        uninstall()
+        return 0
 
     info(f"外服 LoL 一键汉化 v{VERSION}   By: 白丝萝莉 #HEISI   免费工具 欢迎传播")
     try:
@@ -457,7 +575,20 @@ def main():
     except Exception as e:  # 双击运行时别让窗口一闪而过
         fail(f"出错了: {e!r}")
         code = 1
-    if not args.no_pause and sys.stdin and sys.stdin.isatty():
+    interactive = not args.no_pause and sys.stdin and sys.stdin.isatty()
+    if code == 0 and not args.restore and os.name == "nt":
+        try:
+            if args.install:
+                install(args.patchline, args.locale)
+            elif is_installed():
+                install(args.patchline, args.locale)  # 已开启：顺便更新到当前版本/语言
+            elif interactive:
+                answer = input("要不要开启「保持汉化」？开机自动在后台守着，以后不用再运行本工具 [Y/n]: ")
+                if answer.strip().lower() in ("", "y", "yes", "是"):
+                    install(args.patchline, args.locale)
+        except Exception as e:
+            fail(f"开启「保持汉化」失败: {e!r}")
+    if interactive:
         input("按回车退出...")
     return code
 
