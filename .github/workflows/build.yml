@@ -1,0 +1,25 @@
+name: build
+on:
+  push:
+    paths: ["lol.py", ".github/workflows/build.yml"]
+  workflow_dispatch:
+jobs:
+  exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller
+      - run: pyinstaller --onefile --name lol-hanhua lol.py
+      - run: python lol.py --help
+      - run: dist/lol-hanhua.exe --help
+      - name: 自启注册/注销冒烟测试
+        shell: bash
+        run: |
+          python -c "import lol, time, os; lol.setup_console(); lol.install('live', 'zh_CN'); assert lol.is_installed(); time.sleep(3); assert os.path.isfile(lol.PID_FILE), 'watcher did not start'; lol.uninstall(); assert not lol.is_installed(); assert not os.path.exists(lol.PID_FILE)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lol-hanhua
+          path: dist/lol-hanhua.exe
